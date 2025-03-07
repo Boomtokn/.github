@@ -1,0 +1,77 @@
+name: Setup LXD and MAAS
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  setup-lxd-maas:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq iptables-persistent
+
+    - name: Install snaps
+      run: |
+        sudo snap install maas
+        sudo snap install --channel=5.0/stable lxd
+        sudo snap refresh --channel=5.0/stable lxd
+        sudo snap install maas-test-db
+
+    - name: Configure network
+      run: |
+        export IP_ADDRESS=$(ip -j route show default | jq -r '.[].prefsrc')
+        export INTERFACE=$(ip -j route show default | jq -r '.[].dev')
+        sudo sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+        sudo sysctl -p
+        sudo iptables -t nat -A POSTROUTING -o $INTERFACE -j SNAT --to $IP_ADDRESS
+        echo iptables-persistent iptables-persistent/autosave_v4 boolean true | sudo debconf-set-selections
+        echo iptables-persistent iptables-persistent/autosave_v6 boolean true | sudo debconf-set-selections
+        sudo apt-get install iptables-persistent -y
+
+    - name: Initialize LXD
+      run: |
+        cat /tmp/lxd.cfg | sudo lxd init --preseed
+        sudo lxd waitready
+
+    - name: Initialize MAAS
+      run: |
+        sudo maas init region+rack --database-uri maas-test-db:/// --maas-url http://${IP_ADDRESS}:5240/MAAS
+        sleep 15
+        sudo maas createadmin --username admin --password admin --email admin
+        export APIKEY=$(sudo maas apikey --username admin)
+        sudo maas login admin http://localhost:5240/MAAS/ $APIKEY
+        export SUBNET=10.10.10.0/24
+        export FABRIC_ID=$(sudo maas admin subnet read "$SUBNET" | jq -r ".vlan.fabric_id")
+        export VLAN_TAG=$(sudo maas admin subnet read "$SUBNET" | jq -r ".vlan.vid")
+        export PRIMARY_RACK=$(sudo maas admin rack-controllers read | jq -r ".[] | .system_id")
+        sudo maas admin subnet update $SUBNET gateway_ip=10.10.10.1
+        sudo maas admin ipranges create type=dynamic start_ip=10.10.10.200 end_ip=10.10.10.254
+        sudo maas admin vlan update $FABRIC_ID $VLAN_TAG dhcp_on=True primary_rack=$PRIMARY_RACK
+        sudo maas admin maas set-config name=upstream_dns value=8.8.8.8
+        sudo maas admin vm-hosts create password=password type=lxd power_address=https://${IP_ADDRESS}:8443 project=maas
+        ssh-keygen -q -t rsa -N "" -f "/home/runner/.ssh/id_rsa"
+        sudo maas admin sshkeys create key="$(cat /home/runner/.ssh/id_rsa.pub)"
+
+    - name: Save Setup Logs
+      run: |
+        mkdir -p logs
+        sudo journalctl -u lxd > logs/lxd.log
+        sudo journalctl -u maas > logs/maas.log
+      continue-on-error: true
+
+    - name: Upload Logs
+      uses: actions/upload-artifact@v2
+      with:
+        name: setup-logs
+        path: logs
